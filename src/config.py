@@ -13,13 +13,13 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 class ExpConfig:
     # wandb logging
     name: str
-    project: str = "crl_subgoal"
+    project: str = "long-horizon"
     mode: str = "online"
-    entity: str | None = None
+    entity: str = "uhh_machine_learning"
 
     # Replay buffer and batch size and seed
     num_envs: int = 1024
-    batch_size: int = 1024
+    batch_size: int = 256
     seed: int = 0
     max_replay_size: int = 10000
 
