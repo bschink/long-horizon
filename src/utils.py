@@ -3,7 +3,7 @@ import os
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import wandb
-from config import ROOT_DIR
+from constants import ROOT_DIR
 import jax
 import jax.numpy as jnp
 import distrax

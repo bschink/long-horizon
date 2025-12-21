@@ -1,8 +1,10 @@
 import tyro
-from config import Config
+from configs.config import Config
 from envs import create_env
 import functools
 import os
+import importlib
+import sys
 import wandb
 import dataclasses
 import copy
@@ -17,7 +19,7 @@ from impls.agents import create_agent
 from envs.block_moving.block_moving_env import BoxMovingEnv
 from envs.block_moving.wrappers import wrap_for_eval, wrap_for_training
 from envs.block_moving.env_types import TimeStep, remove_targets
-from config import ROOT_DIR
+from constants import ROOT_DIR
 from impls.utils.checkpoints import save_agent
 from utils import log_gif, sample_actions_critic
 
@@ -383,7 +385,19 @@ def train(config: Config):
 
 
 if __name__ == "__main__":
-    args = tyro.cli(Config, config=(tyro.conf.ConsolidateSubcommandArgs,))
+    config_name = "config"
+
+    if "--config" in sys.argv:
+        index = sys.argv.index("--config")
+        config_name = sys.argv[index + 1]
+        # Remove these from sys.argv so tyro doesn't try to parse them as Config fields
+        sys.argv.pop(index)
+        sys.argv.pop(index)
+
+    config_module = importlib.import_module(f"configs.{config_name}")
+    ConfigClass = config_module.Config
+
+    args = tyro.cli(ConfigClass, config=(tyro.conf.ConsolidateSubcommandArgs,))
     if args.exp.batch_size > args.exp.num_envs:
         raise ValueError("Batch size has to be less than or equal to number of environments")
     train(args)
