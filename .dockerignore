@@ -1,0 +1,16 @@
+.git
+.idea
+.vscode
+.venv
+env
+venv
+__pycache__
+experiments/
+runs/
+wandb/
+data/
+notes/
+*.ipynb
+*.png
+# Keep assets as they are needed for the environment/rendering
+!assets/
