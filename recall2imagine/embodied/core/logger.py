@@ -233,6 +233,7 @@ class WandBOutput:
     import wandb
     run = wandb.init(
         name=config.wdb_name,
+        project=getattr(config, 'wdb_project', None),
         config=dict(config),
     )
     self._wandb = wandb

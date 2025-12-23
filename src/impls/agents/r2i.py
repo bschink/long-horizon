@@ -1,9 +1,11 @@
 """Goal-conditioned Recall2Imagine (R2I) agent for BoxMovingEnv.
 
 This module provides a goal-conditioned variant of the R2I agent that:
-- Handles separate 'grid' and 'goal' observation keys
-- Supports `reconstruct_only_obs` to skip goal reconstruction in the decoder loss
-- Can be used with both MLP and CNN encoders
+- Encodes goals separately with frozen encoder weights (detached gradients)
+- Re-encodes goals every forward pass (policy step) with detached gradients
+- Concatenates goal embedding with latent state (deter, stoch) for actor/critic
+- The input to actor/critic is z_g = [deter, stoch, goal_embedding]
+- Only reconstructs observations in decoder (goals are never reconstructed)
 """
 
 import sys
@@ -23,13 +25,14 @@ if _r2i_path.exists():
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import ruamel.yaml as yaml
 
 # Import embodied (it's at recall2imagine/embodied)
 import embodied
 
 # Import recall2imagine modules - they use relative imports so we import the package
-from recall2imagine import behaviors
+from recall2imagine import agent as r2i_agent
 from recall2imagine import jaxagent
 from recall2imagine import jaxutils
 from recall2imagine import nets
@@ -54,12 +57,373 @@ def load_configs():
         return yaml.YAML(typ='safe').load(r2i_path.read_text())
 
 
+class GCRewardHead(nj.Module):
+    """Goal-conditioned reward head: reward = f(deter, stoch, goal_embed).
+    
+    This head takes the latent state (deter, stoch) concatenated with the goal
+    embedding to predict rewards. This allows the reward model to learn the
+    relationship between current state and goal.
+    
+    For HER training, this head will receive constant reward targets when
+    the current state matches the relabeled goal (positive samples).
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        # Get reward_head config, use defaults if not specified
+        reward_cfg = dict(config.reward_head) if hasattr(config, 'reward_head') else {}
+        self._layers = reward_cfg.get('layers', 2)
+        self._units = reward_cfg.get('units', 64)
+        self._act = reward_cfg.get('act', 'silu')
+        self._norm = reward_cfg.get('norm', 'layer')
+        self._dist = reward_cfg.get('dist', 'symlog_disc')
+        self._outscale = reward_cfg.get('outscale', 0.0)
+        self._outnorm = reward_cfg.get('outnorm', False)
+        self._bins = reward_cfg.get('bins', 255)
+        
+        # Create the underlying MLP
+        self._mlp = nets.MLP(
+            shape=(),
+            layers=self._layers,
+            units=self._units,
+            act=self._act,
+            norm=self._norm,
+            dist=self._dist,
+            outscale=self._outscale,
+            outnorm=self._outnorm,
+            bins=self._bins,
+            inputs=['tensor'],  # We'll manually concatenate inputs
+            name='gc_reward_mlp'
+        )
+    
+    def __call__(self, feats):
+        """Compute goal-conditioned reward.
+        
+        Args:
+            feats: Dict containing 'deter', 'stoch', and optionally 'goal_embed'.
+                   If 'goal_embed' is not present, uses zeros (for compatibility).
+        
+        Returns:
+            Reward distribution.
+        """
+        # Get latent state components
+        deter = feats['deter']
+        stoch = feats['stoch']
+        
+        # Flatten stoch if it has categorical structure
+        if len(stoch.shape) > len(deter.shape):
+            stoch = stoch.reshape(stoch.shape[:-2] + (-1,))
+        
+        # Get goal embedding (use zeros if not present for compatibility)
+        if 'goal_embed' in feats:
+            goal_embed = feats['goal_embed']
+            
+            # Handle shape mismatch between deter and goal_embed
+            # deter might have shape (horizon, batch, deter_dim) or (batch, deter_dim)
+            # goal_embed might have shape (horizon, orig_batch, orig_seq, embed_dim) or similar
+            
+            # Flatten goal_embed to match deter's batch dimension
+            while len(goal_embed.shape) > len(deter.shape):
+                # Flatten the extra dimensions
+                goal_embed = goal_embed.reshape(goal_embed.shape[:1] + (-1,) + goal_embed.shape[-1:])
+            
+            # Ensure batch dimension matches
+            if goal_embed.shape[:-1] != deter.shape[:-1]:
+                # Try to tile/broadcast to match
+                if len(goal_embed.shape) == len(deter.shape):
+                    # Both have same num dims, but batch might differ
+                    # Tile along batch dimension if needed
+                    if goal_embed.shape[-2] != deter.shape[-2]:
+                        if len(deter.shape) == 2:
+                            # (batch, embed) - tile to match deter batch
+                            repeats = deter.shape[0] // max(goal_embed.shape[0], 1)
+                            if repeats > 0:
+                                goal_embed = jnp.tile(goal_embed, (repeats, 1))
+                            goal_embed = goal_embed[:deter.shape[0]]
+                        elif len(deter.shape) == 3:
+                            # (horizon, batch, embed) - tile along batch
+                            repeats = deter.shape[1] // max(goal_embed.shape[1], 1)
+                            if repeats > 0:
+                                goal_embed = jnp.tile(goal_embed, (1, repeats, 1))
+                            goal_embed = goal_embed[:, :deter.shape[1]]
+        else:
+            # During world model training, goal_embed might not be in feats
+            # Use zeros as placeholder (reward prediction without goal)
+            goal_embed = jnp.zeros(deter.shape[:-1] + (deter.shape[-1],))
+        
+        # Final check - ensure shapes align for concatenation
+        if goal_embed.shape[:-1] != deter.shape[:-1]:
+            # Reshape goal_embed to match deter's batch dimensions
+            goal_embed = jnp.broadcast_to(
+                goal_embed.reshape((-1,) + goal_embed.shape[-1:])[:deter.reshape(-1, deter.shape[-1]).shape[0]],
+                (deter.reshape(-1, deter.shape[-1]).shape[0], goal_embed.shape[-1])
+            ).reshape(deter.shape[:-1] + (goal_embed.shape[-1],))
+        
+        # Concatenate all inputs: [deter, stoch, goal_embed]
+        # This is the z_g representation
+        combined = jnp.concatenate([deter, stoch, goal_embed], axis=-1)
+        
+        return self._mlp({'tensor': combined})
+
+
+class GCGreedy(nj.Module):
+    """Goal-conditioned Greedy behavior that uses goal embeddings."""
+    
+    def __init__(self, wm, act_space, config):
+        self.wm = wm
+        self.config = config
+        rewfn = lambda s: wm.heads['reward'](s).mean()[1:]
+        if config.critic_type == 'vfunction':
+            critics = {'extr': r2i_agent.VFunction(rewfn, config, name='critic')}
+        else:
+            raise NotImplementedError(config.critic_type)
+        self.ac = GCImagActorCritic(
+            wm, critics, {'extr': 1.0}, act_space, config, name='ac')
+    
+    def initial(self, batch_size):
+        return self.ac.initial(batch_size)
+    
+    def policy(self, latent, state):
+        return self.ac.policy(latent, state)
+    
+    def train(self, imagine, start, data):
+        return self.ac.train(imagine, start, data)
+    
+    def report(self, data):
+        return {}
+
+
+class GCImagActorCritic(nj.Module):
+    """Goal-conditioned Actor-Critic that uses z_g = [latent_state, goal_embedding].
+    
+    The goal embedding is computed by passing goal observations through the frozen
+    encoder (with stop_gradient applied to encoder outputs for goals).
+    """
+    
+    def __init__(self, wm, critics, scales, act_space, config):
+        self.wm = wm
+        critics = {k: v for k, v in critics.items() if scales[k]}
+        for key, scale in scales.items():
+            assert not scale or key in critics, key
+        self.critics = {k: v for k, v in critics.items() if scales[k]}
+        self.scales = scales
+        self.act_space = act_space
+        self.config = config
+        disc = act_space.discrete
+        self.grad = config.actor_grad_disc if disc else config.actor_grad_cont
+        
+        # Actor takes goal-augmented state: [deter, stoch, goal_embedding]
+        # We use custom dims to handle the goal-augmented input
+        self.actor = nets.MLP(
+            name='actor', dims='deter', shape=act_space.shape, **config.actor,
+            dist=config.actor_dist_disc if disc else config.actor_dist_cont)
+        self.retnorms = {
+            k: jaxutils.Moments(**config.retnorm, name=f'retnorm_{k}')
+            for k in critics}
+        self.opt = jaxutils.Optimizer(name='actor_opt', **config.actor_opt)
+    
+    def initial(self, batch_size):
+        return {}
+    
+    def _get_goal_embedding(self, data_or_state):
+        """Compute goal embedding with frozen encoder weights.
+        
+        The goal is encoded using the same encoder as observations, but with
+        stop_gradient applied so gradients don't flow back through the encoder.
+        
+        Raises:
+            ValueError: If no goal data (goal or goal_2d) is found in input.
+        """
+        # Check if we have goal data available - raise error if missing
+        if 'goal' not in data_or_state and 'goal_2d' not in data_or_state:
+            raise ValueError(
+                f"Goal data required but not found. Expected 'goal' or 'goal_2d' key, "
+                f"got keys: {list(data_or_state.keys())}"
+            )
+        
+        # Build goal-only data dict for encoder
+        goal_data = {}
+        for key in data_or_state:
+            if key.startswith('goal'):
+                # Rename goal keys to match observation keys for encoder
+                if key == 'goal':
+                    goal_data['grid'] = data_or_state[key]
+                elif key == 'goal_2d':
+                    goal_data['grid_2d'] = data_or_state[key]
+                else:
+                    goal_data[key] = data_or_state[key]
+        
+        if not goal_data:
+            raise ValueError(
+                "Goal keys found but no valid goal data could be extracted. "
+                "Check that goal/goal_2d keys contain valid data."
+            )
+        
+        # Encode goals with frozen encoder (stop_gradient on output)
+        goal_embed = sg(self.wm.encoder(goal_data))
+        return goal_embed
+    
+    def _augment_state_with_goal(self, state, goal_embed):
+        """Augment latent state with goal embedding: z_g = [deter, stoch, e_g].
+        
+        Handles shape broadcasting/flattening to ensure all inputs match.
+        
+        Raises:
+            ValueError: If goal_embed is None.
+        """
+        if goal_embed is None:
+            raise ValueError("goal_embed cannot be None - goals are required for goal-conditioned RL")
+        
+        deter = state['deter']
+        stoch = state['stoch']
+        
+        # Flatten stoch if it has categorical structure (e.g., [batch, stoch_dim, classes])
+        # We need to match the number of dimensions with deter
+        if len(stoch.shape) > len(deter.shape):
+            # stoch has shape [..., stoch_dim, classes], flatten last two dims
+            stoch = stoch.reshape(stoch.shape[:-2] + (-1,))
+        
+        # Handle goal_embed shape to match deter shape
+        # goal_embed might have (batch, seq, embed) while deter has (batch*seq, deter_dim)
+        # or goal_embed might already be flattened
+        if len(goal_embed.shape) > len(deter.shape):
+            # Flatten goal_embed to match (batch*seq, embed_dim)
+            goal_embed = goal_embed.reshape((-1,) + goal_embed.shape[-1:])
+        
+        # Ensure goal_embed batch dimension matches deter
+        if goal_embed.shape[0] != deter.shape[0]:
+            # If goal_embed is smaller, broadcast/tile it
+            # This can happen if goal is fixed across imagination steps
+            if goal_embed.shape[0] < deter.shape[0]:
+                # Tile goal_embed to match deter batch size
+                repeats = deter.shape[0] // goal_embed.shape[0]
+                goal_embed = jnp.tile(goal_embed, (repeats,) + (1,) * (len(goal_embed.shape) - 1))
+        
+        # Final shape check - truncate or pad if still mismatched
+        if goal_embed.shape[0] != deter.shape[0]:
+            # Take only what we need
+            goal_embed = goal_embed[:deter.shape[0]]
+        
+        # Concatenate deter, stoch, and goal_embed
+        # This creates z_g = [deter, stoch, goal_embedding]
+        augmented = state.copy()
+        augmented['deter'] = jnp.concatenate([deter, stoch, goal_embed], axis=-1)
+        return augmented
+    
+    def policy(self, latent, carry):
+        """Policy function that uses goal-augmented state."""
+        # Get goal embedding if available in latent (during policy execution)
+        goal_embed = latent.get('goal_embed', None)
+        
+        if goal_embed is not None:
+            augmented = self._augment_state_with_goal(latent, goal_embed)
+        else:
+            augmented = latent
+        
+        return {'action': self.actor(augmented)}, carry
+    
+    def train(self, imagine, start, context):
+        """Train with goal-augmented states."""
+        # Get goal embedding from context (frozen encoder)
+        goal_embed = self._get_goal_embedding(context)
+        
+        # Flatten goal_embed to match flattened batch dimensions
+        # context has (batch, seq, ...) but start is flattened to (batch*seq, ...)
+        # goal_embed has shape (batch, seq, embed_dim) -> flatten to (batch*seq, embed_dim)
+        if len(goal_embed.shape) > 2:
+            goal_embed = goal_embed.reshape((-1,) + goal_embed.shape[-1:])
+        
+        def loss(start):
+            # Create policy that augments state with goal embedding
+            def goal_policy(s):
+                aug_s = self._augment_state_with_goal(s, goal_embed)
+                return self.actor(sg(aug_s)).sample(seed=nj.rng())
+            
+            traj = imagine(goal_policy, start, self.config.imag_horizon)
+            
+            # Store goal_embed in traj for critic
+            # traj has shape [horizon, batch, ...]
+            # goal_embed has shape [batch, embed_dim] (already flattened)
+            traj_goal_embed = jnp.broadcast_to(
+                goal_embed[None], 
+                (traj['deter'].shape[0],) + goal_embed.shape
+            )
+            traj['goal_embed'] = traj_goal_embed
+            
+            loss, metrics = self.loss(traj, goal_embed)
+            return loss, (traj, metrics)
+        
+        mets, (traj, metrics) = self.opt(self.actor, loss, start, has_aux=True)
+        metrics.update(mets)
+        for key, critic in self.critics.items():
+            mets = critic.train(traj, self.actor)
+            metrics.update({f'{key}_critic_{k}': v for k, v in mets.items()})
+        return traj, metrics
+    
+    def loss(self, traj, goal_embed=None):
+        """Compute actor loss with goal-augmented states."""
+        metrics = {}
+        advs = []
+        total = sum(self.scales[k] for k in self.critics)
+        for key, critic in self.critics.items():
+            rew, ret, base = critic.score(traj, self.actor)
+            offset, invscale = self.retnorms[key](ret)
+            normed_ret = (ret - offset) / invscale
+            normed_base = (base - offset) / invscale
+            advs.append((normed_ret - normed_base) * self.scales[key] / total)
+            metrics.update(jaxutils.tensorstats(rew, f'{key}_reward'))
+            metrics.update(jaxutils.tensorstats(ret, f'{key}_return_raw'))
+            metrics.update(jaxutils.tensorstats(normed_ret, f'{key}_return_normed'))
+            metrics[f'{key}_return_rate'] = (jnp.abs(ret) >= 0.5).mean()
+        adv = jnp.stack(advs).sum(0)
+        
+        # Broadcast goal_embed to match trajectory dimensions
+        # traj has shape [horizon, batch, ...], goal_embed has [batch, embed_dim]
+        # We need [horizon, batch, embed_dim]
+        if goal_embed is not None and len(goal_embed.shape) < len(traj['deter'].shape):
+            goal_embed_broadcast = jnp.broadcast_to(
+                goal_embed[None], 
+                (traj['deter'].shape[0],) + goal_embed.shape
+            )
+        else:
+            goal_embed_broadcast = goal_embed
+        
+        # Use goal-augmented state for policy
+        aug_traj = self._augment_state_with_goal(traj, goal_embed_broadcast)
+        policy = self.actor(sg(aug_traj))
+        logpi = policy.log_prob(sg(traj['action']))[:-1]
+        loss = {'backprop': -adv, 'reinforce': -logpi * sg(adv)}[self.grad]
+        ent = policy.entropy()[:-1]
+        loss -= self.config.actent * ent
+        loss *= sg(traj['weight'])[:-1]
+        loss *= self.config.loss_scales.actor
+        metrics.update(self._metrics(traj, policy, logpi, ent, adv))
+        return loss.mean(), metrics
+    
+    def _metrics(self, traj, policy, logpi, ent, adv):
+        metrics = {}
+        ent = policy.entropy()[:-1]
+        rand = (ent - policy.minent) / (policy.maxent - policy.minent)
+        rand = rand.mean(range(2, len(rand.shape)))
+        act = traj['action']
+        act = jnp.argmax(act, -1) if self.act_space.discrete else act
+        metrics.update(jaxutils.tensorstats(act, 'action'))
+        metrics.update(jaxutils.tensorstats(rand, 'policy_randomness'))
+        metrics.update(jaxutils.tensorstats(ent, 'policy_entropy'))
+        metrics.update(jaxutils.tensorstats(logpi, 'policy_logprob'))
+        metrics.update(jaxutils.tensorstats(adv, 'adv'))
+        metrics['imag_weight_dist'] = jaxutils.subsample(traj['weight'])
+        return metrics
+
+
 @jaxagent.Wrapper
 class GCR2IAgent(nj.Module):
     """Goal-conditioned R2I Agent.
     
-    This agent extends the standard R2I agent to handle goal-conditioned
-    observations with separate 'grid' and 'goal' keys.
+    This agent extends the standard R2I agent with:
+    - Separate goal embedding with frozen encoder weights
+    - Goal embedding concatenated with latent state for actor/critic
+    - Input to actor/critic: z_g = [deter, stoch, goal_embedding]
     """
     
     configs = load_configs()
@@ -70,11 +434,21 @@ class GCR2IAgent(nj.Module):
         self.act_space = act_space['action']
         self.step = step
         self.wm = GCWorldModel(obs_space, act_space, config, name='wm')
-        self.task_behavior = getattr(behaviors, config.task_behavior)(
-            self.wm, self.act_space, self.config, name='task_behavior')
+        
+        # Use goal-conditioned behavior that handles goal embeddings
+        if config.task_behavior == 'Greedy':
+            self.task_behavior = GCGreedy(
+                self.wm, self.act_space, self.config, name='task_behavior')
+        else:
+            # Fallback to standard behavior for non-Greedy
+            from recall2imagine import behaviors
+            self.task_behavior = getattr(behaviors, config.task_behavior)(
+                self.wm, self.act_space, self.config, name='task_behavior')
+        
         if config.expl_behavior == 'None':
             self.expl_behavior = self.task_behavior
         else:
+            from recall2imagine import behaviors
             self.expl_behavior = getattr(behaviors, config.expl_behavior)(
                 self.wm, self.act_space, self.config, name='expl_behavior')
     
@@ -88,15 +462,36 @@ class GCR2IAgent(nj.Module):
         return self.wm.initial(batch_size)
     
     def policy(self, obs, state, mode='train'):
+        """Forward pass for policy.
+        
+        Each forward pass:
+        1. (Re-)encodes the goal with frozen encoder weights (detached gradients)
+        2. Encodes observations and updates the latent state via RSSM
+        3. Passes z_g = [deter, stoch, goal_embedding] to actor/critic
+        4. Returns action to be appended to buffer
+        """
         self.config.jax.jit and print('Tracing policy function.')
         obs = self.preprocess(obs)
         (prev_latent, prev_action), task_state, expl_state = state
-        embed = self.wm.encoder(obs)
+        
+        # Step 1: Re-encode goals with frozen encoder (detached gradients)
+        # This happens every forward pass to ensure fresh goal embeddings
+        goal_embed = self.wm.encode_goal_frozen(obs)
+        
+        # Step 2: Encode observation (excluding goals) for world model
+        embed = self.wm.encode_obs(obs)
         latent, _ = self.wm.rssm.obs_step(
             prev_latent, prev_action, embed, obs['is_first'])
-        self.expl_behavior.policy(latent, expl_state)
-        task_outs, task_state = self.task_behavior.policy(latent, task_state)
-        expl_outs, expl_state = self.expl_behavior.policy(latent, expl_state)
+        
+        # Attach goal embedding to latent state for actor/critic
+        # goal_embed is always valid (encode_goal_frozen raises if missing)
+        # IMPORTANT: Create separate dict for actor/critic, don't modify latent
+        # because RSSM state must not contain goal_embed key
+        latent_for_actor = {**latent, 'goal_embed': goal_embed}
+        
+        self.expl_behavior.policy(latent_for_actor, expl_state)
+        task_outs, task_state = self.task_behavior.policy(latent_for_actor, task_state)
+        expl_outs, expl_state = self.expl_behavior.policy(latent_for_actor, expl_state)
         if mode == 'eval':
             outs = task_outs
             outs['action'] = outs['action'].sample(seed=nj.rng())
@@ -109,11 +504,16 @@ class GCR2IAgent(nj.Module):
             outs = task_outs
             outs['log_entropy'] = outs['action'].entropy()
             outs['action'] = outs['action'].sample(seed=nj.rng())
+        # Use original latent (without goal_embed) for RSSM state
         state = ((latent, outs['action']), task_state, expl_state)
         return outs, state
     
     def train(self, data, state):
         self.config.jax.jit and print('Tracing train function.')
+        
+        # Relabel data (HER)
+        data = self._relabel_data(data)
+        
         metrics = {}
         data = self.preprocess(data)
         state, wm_outs, mets = self.wm.train(data, state)
@@ -127,7 +527,101 @@ class GCR2IAgent(nj.Module):
             metrics.update({'expl_' + key: value for key, value in mets.items()})
         outs = {}
         return outs, state, metrics
-    
+
+    def _relabel_data(self, data):
+        """Relabel data with goals sampled from future states (HER).
+        
+        This method:
+        1. Samples future time steps t' > t geometrically (or uniformly).
+        2. Sets goal at t to obs at t'.
+        3. Updates reward at t to 1.0 if t == t' else 0.0.
+        """
+        # Only apply relabeling if we have goal keys
+        goal_keys = [k for k in data.keys() if k.startswith('goal')]
+        if not goal_keys:
+            return data
+            
+        # Ensure we have time dimension [batch, length, ...]
+        if len(data['is_first'].shape) < 2:
+            return data
+            
+        batch_size, seq_len = data['is_first'].shape[:2]
+        rng = nj.rng()
+        
+        # Geometric sampling parameters
+        discount = self.config.get('goal_relabel_discount', 0.99)
+        
+        # Sample offsets: floor(log(u) / log(discount))
+        # u ~ U(0,1)
+        u = jax.random.uniform(rng, (batch_size, seq_len))
+        # We want offsets >= 0. log(u) is negative, log(discount) is negative.
+        # This gives a geometric distribution.
+        offsets = jnp.floor(jnp.log(u) / jnp.log(discount)).astype(jnp.int32)
+        
+        # Compute target indices: t' = t + offset
+        indices = jnp.arange(seq_len)[None, :]
+        target_indices = indices + offsets
+        
+        # Clamp to sequence length
+        target_indices = jnp.minimum(target_indices, seq_len - 1)
+        
+        # Validate that t' is in the same episode as t
+        # We use segment IDs derived from is_first
+        segment_ids = jnp.cumsum(data['is_first'].astype(jnp.int32), axis=1)
+        
+        # Helper to gather values at target indices
+        def gather_time(arr, time_idxs):
+            # arr: (B, T, ...)
+            # time_idxs: (B, T)
+            # returns: (B, T, ...)
+            batch_idxs = jnp.arange(batch_size)[:, None]
+            return arr[batch_idxs, time_idxs]
+            
+        target_segments = gather_time(segment_ids, target_indices)
+        current_segments = segment_ids
+        
+        # Valid if segments match (same episode)
+        valid_mask = (target_segments == current_segments)
+        
+        new_data = data.copy()
+        
+        # Update goals
+        for goal_key in goal_keys:
+            # Determine corresponding observation key
+            if '2d' in goal_key:
+                obs_key = 'grid_2d'
+            else:
+                obs_key = 'grid'
+                
+            # Fallback if specific keys not found
+            if obs_key not in data and 'image' in data:
+                obs_key = 'image'
+            
+            if obs_key in data:
+                future_obs = gather_time(data[obs_key], target_indices)
+                current_goal = data[goal_key]
+                
+                # Expand mask to match goal shape
+                mask = valid_mask
+                while len(mask.shape) < len(current_goal.shape):
+                    mask = mask[..., None]
+                
+                # Replace goal with future obs where valid, otherwise keep original
+                new_goal = jnp.where(mask, future_obs, current_goal)
+                new_data[goal_key] = new_goal
+        
+        # Update rewards
+        # Reward is 1.0 (or constant) if t == t', else 0.0
+        # If offset=0, then t=t'.
+        is_match = (indices == target_indices) & valid_mask
+        
+        reward_constant = self.config.get('reward_constant', 1.0)
+        new_reward = jnp.where(is_match, reward_constant, 0.0).astype(jnp.float32)
+        
+        new_data['reward'] = new_reward
+        
+        return new_data
+
     def report(self, data):
         self.config.jax.jit and print('Tracing report function.')
         data = self.preprocess(data)
@@ -157,9 +651,12 @@ class GCR2IAgent(nj.Module):
 class GCWorldModel(nj.Module):
     """Goal-conditioned World Model.
     
-    Extends the standard R2I world model with support for:
-    - Separate grid and goal observations
-    - reconstruct_only_obs option to skip goal reconstruction loss
+    Key features:
+    - Encodes observations (grid) and goals separately
+    - Goals are ALWAYS encoded with frozen encoder weights (stop_gradient)
+    - Goals are re-encoded every forward pass with detached gradients
+    - Only observation encodings are used for RSSM posterior
+    - Decoder only reconstructs observations, NEVER goals
     """
     
     def __init__(self, obs_space, act_space, config):
@@ -172,19 +669,20 @@ class GCWorldModel(nj.Module):
         shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
         self.shapes = shapes
         
-        # Determine which keys to reconstruct
-        self.reconstruct_only_obs = getattr(config, 'reconstruct_only_obs', False)
+        # Identify observation and goal keys
         self._obs_keys = self._get_obs_keys()
+        self._goal_keys = self._get_goal_keys()
         
-        # Create encoder (uses all observation keys)
-        self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
+        # Shapes for observation-only encoder/decoder (goals are never reconstructed)
+        self._obs_shapes = {k: v for k, v in shapes.items() if k in self._obs_keys}
+        self._goal_shapes = {k: v for k, v in shapes.items() if k in self._goal_keys}
         
-        # Create decoder
-        if self.reconstruct_only_obs:
-            # Only reconstruct observation keys (grid, grid_2d), not goals
-            decoder_shapes = {k: v for k, v in shapes.items() if k in self._obs_keys}
-        else:
-            decoder_shapes = shapes
+        # Create encoder for observations only (goals encoded separately with frozen weights)
+        self.encoder = nets.MultiEncoder(self._obs_shapes, **config.encoder, name='enc')
+        
+        # Decoder only reconstructs observations, never goals
+        # Goals are always detached from the world model
+        decoder_shapes = self._obs_shapes
         self.decoder_shapes = decoder_shapes
         
         # Setup RSSM
@@ -201,9 +699,10 @@ class GCWorldModel(nj.Module):
         self.rssm = rssms[config.ssm_type](**kws[config.ssm_type], name='rssm')
         
         # Setup heads
+        # Use goal-conditioned reward head that takes [deter, stoch, goal_embed]
         self.heads = {
             'decoder': nets.MultiDecoder(decoder_shapes, **config.decoder, name='dec'),
-            'reward': nets.MLP((), **config.reward_head, name='rew'),
+            'reward': GCRewardHead(config, name='rew'),  # Goal-conditioned reward
             'cont': nets.MLP((), **config.cont_head, name='cont'),
         }
         
@@ -223,13 +722,53 @@ class GCWorldModel(nj.Module):
         self.scales = scales
     
     def _get_obs_keys(self):
-        """Get observation keys (excluding goals) for reconstruct_only_obs."""
+        """Get observation keys (excluding goals)."""
         obs_keys = set()
         for key in self.shapes.keys():
-            # Keys that represent observations (not goals)
             if key in ('grid', 'grid_2d'):
                 obs_keys.add(key)
         return obs_keys
+    
+    def _get_goal_keys(self):
+        """Get goal keys."""
+        goal_keys = set()
+        for key in self.shapes.keys():
+            if key.startswith('goal'):
+                goal_keys.add(key)
+        return goal_keys
+    
+    def encode_obs(self, data):
+        """Encode only observations (not goals) for world model."""
+        obs_data = {k: v for k, v in data.items() if k in self._obs_keys}
+        return self.encoder(obs_data)
+    
+    def encode_goal_frozen(self, data):
+        """Encode goals with frozen encoder weights (stop_gradient).
+        
+        The goal is encoded using the same encoder architecture, but with
+        stop_gradient applied so gradients don't flow through the encoder.
+        
+        Raises:
+            ValueError: If no goal data found or goal data cannot be mapped.
+        """
+        # Build goal data dict, mapping goal keys to obs keys for encoder
+        goal_data = {}
+        for key in data:
+            if key == 'goal' and 'grid' in self._obs_keys:
+                goal_data['grid'] = data[key]
+            elif key == 'goal_2d' and 'grid_2d' in self._obs_keys:
+                goal_data['grid_2d'] = data[key]
+        
+        if not goal_data:
+            raise ValueError(
+                f"Goal data required but not found or cannot be mapped. "
+                f"Expected 'goal' (with 'grid' in obs_keys) or 'goal_2d' (with 'grid_2d' in obs_keys). "
+                f"Got keys: {list(data.keys())}, obs_keys: {self._obs_keys}"
+            )
+        
+        # Encode with frozen weights (stop_gradient on output)
+        goal_embed = sg(self.encoder(goal_data))
+        return goal_embed
     
     def initial(self, batch_size):
         prev_latent = self.rssm.initial(batch_size)
@@ -244,7 +783,17 @@ class GCWorldModel(nj.Module):
         return state, outs, metrics
     
     def loss(self, data, state):
-        embed = self.encoder(data)
+        # Encode only observations for world model
+        embed = self.encode_obs(data)
+        
+        # Encode goals (frozen) if available
+        # This is needed for the reward head which takes goal_embed
+        goal_embed = None
+        if 'goal' in data or 'goal_2d' in data:
+            # This returns (batch, seq, embed) if data has time dim, or (batch, embed)
+            # data has (batch, seq, ...)
+            goal_embed = self.encode_goal_frozen(data)
+            
         prev_latent, prev_action = state
         prev_actions = jnp.concatenate([
             prev_action[:, None], data['action'][:, :-1]], 1)
@@ -253,6 +802,11 @@ class GCWorldModel(nj.Module):
         
         dists = {}
         feats = {**post, 'embed': embed}
+        
+        # Add goal_embed to feats if available
+        if goal_embed is not None:
+            feats['goal_embed'] = goal_embed
+            
         for name, head in self.heads.items():
             out = head(feats if name in self.config.grad_heads else sg(feats))
             out = out if isinstance(out, dict) else {name: out}
@@ -262,7 +816,7 @@ class GCWorldModel(nj.Module):
         losses['dyn'] = self.rssm.dyn_loss(post, prior, **self.config.dyn_loss)
         losses['rep'] = self.rssm.rep_loss(post, prior, **self.config.rep_loss)
         
-        # Compute reconstruction losses
+        # Compute reconstruction losses (only for decoder shapes)
         for key, dist in dists.items():
             if key in data:
                 loss = -dist.log_prob(data[key].astype(jnp.float32))

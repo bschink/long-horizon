@@ -124,7 +124,17 @@ def _restore_array(original, new_value):
     dtype = getattr(original, 'dtype', new_value.dtype)
     array = new_value.astype(dtype)
     if hasattr(original, 'device'):
-        return jax.device_put(array, original.device())
+        device = original.device
+        if callable(device):
+            return jax.device_put(array, device())
+        elif hasattr(device, 'platform') or str(device) != 'cpu':
+            # device is a valid device object
+            try:
+                return jax.device_put(array, device)
+            except (ValueError, TypeError):
+                # If device_put fails, just return the array
+                return array
+        # For CPU or invalid devices, just return the array
     if hasattr(original, 'devices'):
         return jax.device_put(array)
     return array

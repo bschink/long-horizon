@@ -11,6 +11,7 @@ defaults:
   replay: lfs
   replay_size: 1e7
   wdb_name: R2I
+  wdb_project: r2i-long-horizon
   replay_online: False
   eval_dir: ''
   filter: '.*'
