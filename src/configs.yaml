@@ -329,10 +329,11 @@ box_moving:
   # Observation encoding options
   mlp_flatten_grid: True
   cnn_2d_grid: False
-  reconstruct_only_obs: False
   
   # Training settings (single GPU friendly)
-  envs: {amount: 4, parallel: process, length: 0, reset: True, restart: True, discretize: 0, checks: False}
+  # Use 'none' or 'thread' instead of 'process' to avoid subprocess GPU initialization
+  # With 'none', environments run sequentially in main process (safest)
+  envs: {amount: 4, parallel: none, length: 0, reset: True, restart: True, discretize: 0, checks: False}
   run.script: train
   run.steps: 1e7
   run.train_ratio: 32
@@ -344,7 +345,7 @@ box_moving:
   
   # Replay buffer settings - batch_length = episode_length
   replay_size: 1e6
-  batch_size: 4
+  batch_size: 32
   batch_length: 100
   
   # World model - reduced for single GPU memory
@@ -355,18 +356,18 @@ box_moving:
   rssm: {deter: 128, units: 64, hidden: 32, stoch: 8, classes: 8}
   
   # Actor-critic settings (kept reasonable)
-  actor: {layers: 2, units: 128}
-  critic: {layers: 2, units: 128}
-  reward_head: {layers: 2, units: 64}
+  actor: {layers: 3, units: 256}
+  critic: {layers: 3, units: 256}
+  reward_head: {layers: 3, units: 256}
   cont_head: {layers: 2, units: 64}
   
   # SSM settings - minimal
-  ssm.n_layers: 2
-  ssm_cell.n_blocks: 1
+  ssm.n_layers: 4
+  ssm_cell.n_blocks: 2
   
   # Horizon for imagination
   horizon: 100
-  imag_horizon: 15
+  imag_horizon: 10
 
 # Box moving with CNN encoder (2D grid as image) - single GPU
 box_moving_cnn:
@@ -452,3 +453,65 @@ box_moving_debug:
   horizon: 50
   imag_horizon: 8
   .*unroll: False
+
+box_moving_11GB:
+  task: box_moving
+  
+  # 1. Critical Memory Savings
+  jax.precision: float16
+  
+  # 2. Environment Settings
+  env.box_moving: 
+    grid_size: 5
+    episode_length: 100
+    number_of_boxes_min: 3
+    number_of_boxes_max: 4
+    number_of_moving_boxes_max: 2
+    terminate_when_success: False
+    dense_rewards: False
+    negative_sparse: False
+    level_generator: default
+    generator_special: False
+
+  # 3. Observation Processing
+  mlp_flatten_grid: True
+  cnn_2d_grid: False
+
+  # 4. Parallelization (Reduced for single GPU - avoid subprocess GPU init)
+  envs: 
+    amount: 4             # Reduced to avoid OOM from subprocess GPU initialization
+    parallel: none        # Use 'none' to run envs in main process (avoids GPU memory conflicts)
+  
+  batch_size: 4           # Low training batch (training is expensive due to BPTT)
+  batch_length: 100       # Fixed as requested
+  
+  # 5. Training Ratio
+  # With 4 envs, we can use a higher train ratio for more learning per env step
+  run.train_ratio: 32
+  
+  # 6. Replay Buffer
+  replay_size: 1e6
+
+  # 7. Model Architecture (Tuned for 11GB)
+  # slightly larger than the 'debug' models, but smaller than 'defaults'
+  
+  # Encoder/Decoder
+  encoder: {mlp_keys: 'grid|goal', cnn_keys: '$^', mlp_layers: 3, mlp_units: 256, symlog_inputs: False}
+  decoder: {mlp_keys: 'grid|goal', cnn_keys: '$^', mlp_layers: 3, mlp_units: 256, vector_dist: mse}
+  
+  # RSSM (The core memory consumer)
+  rssm: {deter: 256, units: 256, hidden: 256, stoch: 32, classes: 32}
+  
+  # Heads
+  actor: {layers: 3, units: 256}
+  critic: {layers: 3, units: 256}
+  reward_head: {layers: 3, units: 256}
+  cont_head: {layers: 3, units: 256}
+  
+  # Simplified SSM
+  ssm.n_layers: 2
+  ssm_cell.n_blocks: 4
+  
+  # Imagination
+  horizon: 100        # Matching episode length often helps
+  imag_horizon: 10    # Horizon for actor-critic planning

@@ -1,0 +1,57 @@
+# Use the official NVIDIA JAX Release 25.04 container
+# Contains: JAX 0.5.3, jaxlib 0.5.3, Flax 0.10.5, Python 3.12, CUDA 12.9.0
+FROM nvcr.io/nvidia/jax:25.04-py3
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# 1. Freeze ALL JAX-related packages from NVIDIA container to prevent any changes
+#    This prevents transitive dependencies from upgrading/changing JAX ecosystem
+RUN pip freeze | grep -iE "^(jax|flax|optax|orbax|chex|ml.dtypes|transformer.engine)" > /tmp/constraints.txt && \
+    echo "=== Locked JAX ecosystem versions ===" && \
+    cat /tmp/constraints.txt
+
+# 2. Copy pyproject.toml (JAX/flax already commented out)
+COPY pyproject.toml .
+
+# 3. Install distrax without its JAX dependencies (it will use container's JAX)
+RUN pip install --no-cache-dir --no-deps distrax && \
+    pip install --no-cache-dir -c /tmp/constraints.txt tensorflow-probability
+
+# 4. Upgrade protobuf to fix wandb compatibility (wandb needs >= 6.31.1)
+RUN pip install --no-cache-dir --upgrade "protobuf>=6.31.1"
+
+# 5. Install remaining dependencies with constraints to protect JAX ecosystem
+RUN pip install --no-cache-dir -c /tmp/constraints.txt \
+    filelock \
+    gym \
+    matplotlib \
+    ml-collections \
+    moviepy \
+    ogbench \
+    pandas \
+    pytest \
+    ruff \
+    ruamel.yaml \
+    tqdm \
+    tyro \
+    wandb \
+    xminigrid
+
+# 6. Install the project in editable mode (no deps, already installed)
+RUN pip install --no-cache-dir --no-deps -e .
+
+# 7. Verify JAX installation uses container's version
+RUN python -c "import jax; print(f'JAX version: {jax.__version__}'); print(f'Devices: {jax.devices()}')"
+
+COPY src/ src/
+COPY recall2imagine/ recall2imagine/
+COPY scripts/ scripts/
+COPY README.md .
+COPY assets/ assets/
+
+# 8. EXECUTION
+RUN chmod +x scripts/paper_experiments/run_default_paper_exp_local.sh
+ENTRYPOINT ["scripts/paper_experiments/run_default_paper_exp_local.sh"]

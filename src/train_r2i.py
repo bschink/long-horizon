@@ -44,7 +44,6 @@ warnings.filterwarnings('ignore', '.*truncated to dtype int32.*')
 # it to be permissive during environment initialization
 import jax
 jax.config.update('jax_transfer_guard', 'allow')
-import jax.numpy as jnp
 
 import numpy as np
 
@@ -53,7 +52,6 @@ from embodied import wrappers
 
 from envs.embodied_wrapper import EmbodiedBoxMovingWrapper, make_box_moving_env
 from envs.block_moving.env_types import BoxMovingConfig
-from impls.utils.datasets import Dataset, GCDataset
 from impls.utils.log_utils import CsvLogger
 
 
@@ -82,152 +80,6 @@ class CsvOutput:
         self._writer.close()
 
 
-DEFAULT_HER_CONFIG = {
-    'enabled': True,
-    'discount': 0.99,
-    'value_p_curgoal': 0.1,
-    'value_p_trajgoal': 0.8,
-    'value_p_randomgoal': 0.1,
-    'value_geom_sample': True,
-    'actor_p_curgoal': 0.1,
-    'actor_p_trajgoal': 0.8,
-    'actor_p_randomgoal': 0.1,
-    'actor_geom_sample': True,
-    'gc_negative': False,
-    'p_aug': None,
-    'frame_stack': None,
-}
-
-
-def _extract_config_dict(config, key):
-    try:
-        nested = getattr(config, key)
-    except AttributeError:
-        return {}
-    return dict(nested)
-
-
-def _resolve_her_config(config):
-    cfg = DEFAULT_HER_CONFIG.copy()
-    cfg.update(_extract_config_dict(config, 'her'))
-    cfg['enabled'] = bool(cfg.get('enabled', True))
-    return cfg
-
-
-def _to_numpy(value):
-    if isinstance(value, np.ndarray):
-        return value
-    return np.asarray(jax.device_get(value))
-
-
-def _restore_array(original, new_value):
-    dtype = getattr(original, 'dtype', new_value.dtype)
-    array = new_value.astype(dtype)
-    if hasattr(original, 'device'):
-        device = original.device
-        if callable(device):
-            return jax.device_put(array, device())
-        elif hasattr(device, 'platform') or str(device) != 'cpu':
-            # device is a valid device object
-            try:
-                return jax.device_put(array, device)
-            except (ValueError, TypeError):
-                # If device_put fails, just return the array
-                return array
-        # For CPU or invalid devices, just return the array
-    if hasattr(original, 'devices'):
-        return jax.device_put(array)
-    return array
-
-
-def _compute_terminal_mask(is_first):
-    """Return a flat mask that marks the last transition of every trajectory."""
-    batch, horizon = is_first.shape
-    terminals = np.zeros((batch, horizon), dtype=np.float32)
-    if horizon > 1:
-        # When the next step starts a new episode, the current one is terminal.
-        terminals[:, :-1] = np.where(is_first[:, 1:], 1.0, 0.0)
-    # Always treat the final collected step in the sequence as terminal.
-    terminals[:, -1] = 1.0
-    return terminals.reshape(-1)
-
-
-def _apply_her_to_batch(batch, her_cfg):
-    if not her_cfg.get('enabled', True):
-        return batch, {}
-    required_keys = ('grid', 'goal', 'is_first')
-    if any(key not in batch for key in required_keys):
-        return batch, {}
-
-    grid_np = _to_numpy(batch['grid'])
-    goal_np = _to_numpy(batch['goal'])
-    is_first_np = _to_numpy(batch['is_first']).astype(bool)
-
-    batch_size, horizon = grid_np.shape[:2]
-    obs_tree = {'grid': grid_np.reshape(batch_size * horizon, -1)}
-    if 'grid_2d' in batch:
-        grid2d = _to_numpy(batch['grid_2d'])
-        obs_tree['grid_2d'] = grid2d.reshape(batch_size * horizon, *grid2d.shape[2:])
-
-    terminals = _compute_terminal_mask(is_first_np.reshape(batch_size, horizon))
-    num_transitions = obs_tree['grid'].shape[0]
-    dataset = Dataset.create(
-        freeze=False,
-        observations=obs_tree['grid'],
-        terminals=terminals,
-        valids=1.0 - terminals,
-    )
-    gc_dataset = GCDataset(dataset=dataset, config=her_cfg, preprocess_frame_stack=False)
-    idxs = np.arange(num_transitions)
-    her_batch = gc_dataset.sample(num_transitions, idxs=idxs, evaluation=True)
-
-    new_goal_flat = her_batch['value_goals']
-    new_goal = new_goal_flat.reshape(goal_np.shape)
-    diff = np.abs(new_goal - goal_np)
-    stats = {
-        'her/relabel_fraction': float((diff > 1e-6).mean()) if diff.size else 0.0,
-    }
-    batch['goal'] = _restore_array(batch['goal'], new_goal)
-
-    if 'goal_2d' in batch:
-        goal2d = new_goal_flat.reshape(_to_numpy(batch['goal_2d']).shape)
-        batch['goal_2d'] = _restore_array(batch['goal_2d'], goal2d)
-
-    return batch, stats
-
-
-def _wrap_agent_dataset_with_her(agent, her_cfg):
-    if not her_cfg.get('enabled', True):
-        return
-
-    def postprocess(batch):
-        batch, _ = _apply_her_to_batch(batch, her_cfg)
-        return agent._convert_inps(batch, agent.train_devices)
-
-    def dataset(source, shared_memory=True):
-        if shared_memory:
-            batcher = embodied.BatcherSM(
-                replay=source,
-                workers=agent.data_loaders,
-                batch_size=agent.batch_size,
-                batch_sequence_len=agent.batch_length,
-                postprocess=postprocess,
-                prefetch_source=4,
-                prefetch_batch=agent.num_buffers,
-            )
-        else:
-            batcher = embodied.Batcher(
-                sources=[source] * agent.batch_size,
-                workers=agent.data_loaders,
-                postprocess=postprocess,
-                prefetch_source=4,
-                prefetch_batch=1,
-            )
-        return batcher()
-
-    agent.dataset = dataset
-
-
 def main(argv=None):
     """Main training function."""
     from impls.agents.r2i import GCR2IAgent
@@ -241,7 +93,6 @@ def main(argv=None):
         else:
             print(f"Warning: Config '{name}' not found, skipping")
     config = embodied.Flags(config).parse(other)
-    her_config = _resolve_her_config(config)
     np.random.seed(config.seed)
     
     args = embodied.Config(
@@ -274,7 +125,6 @@ def main(argv=None):
             env = make_envs(config)
             cleanup.append(env)
             agent = GCR2IAgent(env.obs_space, env.act_space, step, config)
-            _wrap_agent_dataset_with_her(agent, her_config)
             replay.set_agent(agent)
             embodied.run.train(agent, env, replay, logger, args, config)
         
@@ -285,7 +135,6 @@ def main(argv=None):
             eval_env = make_envs(config)
             cleanup += [env, eval_env]
             agent = GCR2IAgent(env.obs_space, env.act_space, step, config)
-            _wrap_agent_dataset_with_her(agent, her_config)
             embodied.run.train_eval(
                 agent, env, eval_env, replay, eval_replay, logger, args)
         

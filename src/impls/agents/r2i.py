@@ -57,6 +57,44 @@ def load_configs():
         return yaml.YAML(typ='safe').load(r2i_path.read_text())
 
 
+def _broadcast_goal_embed(goal_embed, target_shape):
+    """Broadcast goal_embed to match target_shape prefix (batch dimensions).
+    
+    This handles the common case where:
+    - goal_embed is (Batch, Dim) and target is (Horizon, Batch, Dim)
+    - goal_embed is (Batch, Seq, Dim) and target is (Batch*Seq, Dim)
+    
+    Args:
+        goal_embed: Goal embedding array
+        target_shape: Target shape to match (typically deter.shape)
+        
+    Returns:
+        goal_embed broadcast to match target_shape prefix
+    """
+    target_prefix = target_shape[:-1]  # All dims except feature dim
+    
+    # First, flatten any extra dimensions in goal_embed beyond 2D
+    while len(goal_embed.shape) > len(target_shape):
+        # Flatten middle dimensions: (A, B, C, D) -> (A, B*C, D)
+        goal_embed = goal_embed.reshape(
+            goal_embed.shape[:1] + (-1,) + goal_embed.shape[-1:]
+        )
+    
+    # Expand dimensions if goal_embed has fewer dims than target
+    diff_dims = len(target_shape) - len(goal_embed.shape)
+    if diff_dims > 0:
+        # Prepend singleton dimensions: (B, D) -> (1, B, D) for (H, B, D) alignment
+        goal_embed = jnp.expand_dims(goal_embed, axis=tuple(range(diff_dims)))
+    
+    # Now broadcast to match target prefix
+    goal_embed = jnp.broadcast_to(
+        goal_embed, 
+        target_prefix + goal_embed.shape[-1:]
+    )
+    
+    return goal_embed
+
+
 class GCRewardHead(nj.Module):
     """Goal-conditioned reward head: reward = f(deter, stoch, goal_embed).
     
@@ -100,11 +138,13 @@ class GCRewardHead(nj.Module):
         """Compute goal-conditioned reward.
         
         Args:
-            feats: Dict containing 'deter', 'stoch', and optionally 'goal_embed'.
-                   If 'goal_embed' is not present, uses zeros (for compatibility).
+            feats: Dict containing 'deter', 'stoch', and 'goal_embed'.
         
         Returns:
             Reward distribution.
+            
+        Raises:
+            ValueError: If 'goal_embed' is not present in feats.
         """
         # Get latent state components
         deter = feats['deter']
@@ -114,56 +154,111 @@ class GCRewardHead(nj.Module):
         if len(stoch.shape) > len(deter.shape):
             stoch = stoch.reshape(stoch.shape[:-2] + (-1,))
         
-        # Get goal embedding (use zeros if not present for compatibility)
-        if 'goal_embed' in feats:
-            goal_embed = feats['goal_embed']
-            
-            # Handle shape mismatch between deter and goal_embed
-            # deter might have shape (horizon, batch, deter_dim) or (batch, deter_dim)
-            # goal_embed might have shape (horizon, orig_batch, orig_seq, embed_dim) or similar
-            
-            # Flatten goal_embed to match deter's batch dimension
-            while len(goal_embed.shape) > len(deter.shape):
-                # Flatten the extra dimensions
-                goal_embed = goal_embed.reshape(goal_embed.shape[:1] + (-1,) + goal_embed.shape[-1:])
-            
-            # Ensure batch dimension matches
-            if goal_embed.shape[:-1] != deter.shape[:-1]:
-                # Try to tile/broadcast to match
-                if len(goal_embed.shape) == len(deter.shape):
-                    # Both have same num dims, but batch might differ
-                    # Tile along batch dimension if needed
-                    if goal_embed.shape[-2] != deter.shape[-2]:
-                        if len(deter.shape) == 2:
-                            # (batch, embed) - tile to match deter batch
-                            repeats = deter.shape[0] // max(goal_embed.shape[0], 1)
-                            if repeats > 0:
-                                goal_embed = jnp.tile(goal_embed, (repeats, 1))
-                            goal_embed = goal_embed[:deter.shape[0]]
-                        elif len(deter.shape) == 3:
-                            # (horizon, batch, embed) - tile along batch
-                            repeats = deter.shape[1] // max(goal_embed.shape[1], 1)
-                            if repeats > 0:
-                                goal_embed = jnp.tile(goal_embed, (1, repeats, 1))
-                            goal_embed = goal_embed[:, :deter.shape[1]]
-        else:
-            # During world model training, goal_embed might not be in feats
-            # Use zeros as placeholder (reward prediction without goal)
-            goal_embed = jnp.zeros(deter.shape[:-1] + (deter.shape[-1],))
+        # Get goal embedding - REQUIRED for goal-conditioned reward
+        if 'goal_embed' not in feats:
+            raise ValueError(
+                f"GCRewardHead requires 'goal_embed' in feats but it was not found. "
+                f"Available keys: {list(feats.keys())}. "
+                f"Ensure goal embeddings are passed to the reward head during training."
+            )
         
-        # Final check - ensure shapes align for concatenation
-        if goal_embed.shape[:-1] != deter.shape[:-1]:
-            # Reshape goal_embed to match deter's batch dimensions
-            goal_embed = jnp.broadcast_to(
-                goal_embed.reshape((-1,) + goal_embed.shape[-1:])[:deter.reshape(-1, deter.shape[-1]).shape[0]],
-                (deter.reshape(-1, deter.shape[-1]).shape[0], goal_embed.shape[-1])
-            ).reshape(deter.shape[:-1] + (goal_embed.shape[-1],))
+        goal_embed = _broadcast_goal_embed(feats['goal_embed'], deter.shape)
         
         # Concatenate all inputs: [deter, stoch, goal_embed]
         # This is the z_g representation
         combined = jnp.concatenate([deter, stoch, goal_embed], axis=-1)
         
         return self._mlp({'tensor': combined})
+
+
+class GCVFunction(nj.Module):
+    """Goal-conditioned Value Function: V(s, g).
+    
+    This value function takes [deter, stoch, goal_embed] as input to estimate
+    the goal-conditioned value. It follows the same interface as r2i_agent.VFunction
+    but properly handles the goal embedding.
+    """
+    
+    def __init__(self, rewfn, config):
+        self.rewfn = rewfn
+        self.config = config
+        # Note: We use inputs=['tensor'] to handle our manually concatenated input
+        # instead of dims='deter' which would only use the deter key
+        # Filter out 'inputs' from critic config since we override it with 'tensor'
+        critic_config = {k: v for k, v in dict(self.config.critic).items() if k != 'inputs'}
+        self.net = nets.MLP((), name='net', inputs=['tensor'], **critic_config)
+        self.slow = nets.MLP((), name='slow', inputs=['tensor'], **critic_config)
+        self.updater = jaxutils.SlowUpdater(
+            self.net, self.slow,
+            self.config.slow_critic_fraction,
+            self.config.slow_critic_update)
+        self.opt = jaxutils.Optimizer(name='critic_opt', **self.config.critic_opt)
+    
+    def _get_input(self, traj):
+        """Concatenate deter, stoch, and goal_embed into a single tensor."""
+        deter = traj['deter']
+        stoch = traj['stoch']
+        
+        # Flatten stoch if it has categorical structure
+        if len(stoch.shape) > len(deter.shape):
+            stoch = stoch.reshape(stoch.shape[:-2] + (-1,))
+        
+        # Get goal embedding - it MUST be present for goal-conditioned RL
+        if 'goal_embed' not in traj:
+            raise ValueError(
+                f"goal_embed required for GCVFunction but not found. "
+                f"Available keys: {list(traj.keys())}"
+            )
+        
+        goal_embed = _broadcast_goal_embed(traj['goal_embed'], deter.shape)
+        
+        # Concatenate: z_g = [deter, stoch, goal_embed]
+        return jnp.concatenate([deter, stoch, goal_embed], axis=-1)
+    
+    def train(self, traj, actor):
+        target = sg(self.score(traj)[1])
+        mets, metrics = self.opt(self.net, self.loss, traj, target, has_aux=True)
+        metrics.update(mets)
+        self.updater()
+        return metrics
+    
+    def loss(self, traj, target):
+        metrics = {}
+        traj = {k: v[:-1] for k, v in traj.items()}
+        inp = self._get_input(traj)
+        dist = self.net({'tensor': inp})
+        loss = -dist.log_prob(sg(target))
+        if self.config.critic_slowreg == 'logprob':
+            slow_inp = self._get_input(traj)
+            reg = -dist.log_prob(sg(self.slow({'tensor': slow_inp}).mean()))
+        elif self.config.critic_slowreg == 'xent':
+            slow_inp = self._get_input(traj)
+            reg = -jnp.einsum(
+                '...i,...i->...',
+                sg(self.slow({'tensor': slow_inp}).probs),
+                jnp.log(dist.probs))
+        else:
+            raise NotImplementedError(self.config.critic_slowreg)
+        loss += self.config.loss_scales.slowreg * reg
+        loss = (loss * sg(traj['weight'])).mean()
+        loss *= self.config.loss_scales.critic
+        metrics = jaxutils.tensorstats(dist.mean())
+        return loss, metrics
+    
+    def score(self, traj, actor=None):
+        rew = self.rewfn(traj)
+        assert len(rew) == len(traj['action']) - 1, (
+            'should provide rewards for all but last action')
+        discount = 1 - 1 / self.config.horizon
+        disc = traj['cont'][1:] * discount
+        inp = self._get_input(traj)
+        value = self.net({'tensor': inp}).mean()
+        vals = [value[-1]]
+        interm = rew + disc * value[1:] * (1 - self.config.return_lambda)
+        for t in reversed(range(len(disc))):
+            vals.append(interm[t] + disc[t] * self.config.return_lambda * vals[-1])
+        ret = jnp.stack(list(reversed(vals))[:-1])
+        return rew, ret, value[:-1]
 
 
 class GCGreedy(nj.Module):
@@ -174,7 +269,8 @@ class GCGreedy(nj.Module):
         self.config = config
         rewfn = lambda s: wm.heads['reward'](s).mean()[1:]
         if config.critic_type == 'vfunction':
-            critics = {'extr': r2i_agent.VFunction(rewfn, config, name='critic')}
+            # Use goal-conditioned VFunction that properly handles goal_embed
+            critics = {'extr': GCVFunction(rewfn, config, name='critic')}
         else:
             raise NotImplementedError(config.critic_type)
         self.ac = GCImagActorCritic(
@@ -266,7 +362,8 @@ class GCImagActorCritic(nj.Module):
     def _augment_state_with_goal(self, state, goal_embed):
         """Augment latent state with goal embedding: z_g = [deter, stoch, e_g].
         
-        Handles shape broadcasting/flattening to ensure all inputs match.
+        Uses robust JAX broadcasting to handle all shape combinations properly.
+        This is multi-GPU safe as it uses pure JAX operations.
         
         Raises:
             ValueError: If goal_embed is None.
@@ -283,26 +380,8 @@ class GCImagActorCritic(nj.Module):
             # stoch has shape [..., stoch_dim, classes], flatten last two dims
             stoch = stoch.reshape(stoch.shape[:-2] + (-1,))
         
-        # Handle goal_embed shape to match deter shape
-        # goal_embed might have (batch, seq, embed) while deter has (batch*seq, deter_dim)
-        # or goal_embed might already be flattened
-        if len(goal_embed.shape) > len(deter.shape):
-            # Flatten goal_embed to match (batch*seq, embed_dim)
-            goal_embed = goal_embed.reshape((-1,) + goal_embed.shape[-1:])
-        
-        # Ensure goal_embed batch dimension matches deter
-        if goal_embed.shape[0] != deter.shape[0]:
-            # If goal_embed is smaller, broadcast/tile it
-            # This can happen if goal is fixed across imagination steps
-            if goal_embed.shape[0] < deter.shape[0]:
-                # Tile goal_embed to match deter batch size
-                repeats = deter.shape[0] // goal_embed.shape[0]
-                goal_embed = jnp.tile(goal_embed, (repeats,) + (1,) * (len(goal_embed.shape) - 1))
-        
-        # Final shape check - truncate or pad if still mismatched
-        if goal_embed.shape[0] != deter.shape[0]:
-            # Take only what we need
-            goal_embed = goal_embed[:deter.shape[0]]
+        # Use robust broadcasting to match goal_embed to deter shape
+        goal_embed = _broadcast_goal_embed(goal_embed, deter.shape)
         
         # Concatenate deter, stoch, and goal_embed
         # This creates z_g = [deter, stoch, goal_embedding]
@@ -587,28 +666,26 @@ class GCR2IAgent(nj.Module):
         
         # Update goals
         for goal_key in goal_keys:
-            # Determine corresponding observation key
-            if '2d' in goal_key:
-                obs_key = 'grid_2d'
-            else:
-                obs_key = 'grid'
-                
-            # Fallback if specific keys not found
-            if obs_key not in data and 'image' in data:
-                obs_key = 'image'
+            # Determine corresponding observation key using world model's mapping
+            obs_key = self.wm._goal_key_to_obs_key(goal_key)
             
-            if obs_key in data:
-                future_obs = gather_time(data[obs_key], target_indices)
-                current_goal = data[goal_key]
-                
-                # Expand mask to match goal shape
-                mask = valid_mask
-                while len(mask.shape) < len(current_goal.shape):
-                    mask = mask[..., None]
-                
-                # Replace goal with future obs where valid, otherwise keep original
-                new_goal = jnp.where(mask, future_obs, current_goal)
-                new_data[goal_key] = new_goal
+            if obs_key not in data:
+                raise ValueError(
+                    f"Cannot relabel goal '{goal_key}': corresponding observation key "
+                    f"'{obs_key}' not found in data. Available keys: {list(data.keys())}"
+                )
+            
+            future_obs = gather_time(data[obs_key], target_indices)
+            current_goal = data[goal_key]
+            
+            # Expand mask to match goal shape
+            mask = valid_mask
+            while len(mask.shape) < len(current_goal.shape):
+                mask = mask[..., None]
+            
+            # Replace goal with future obs where valid, otherwise keep original
+            new_goal = jnp.where(mask, future_obs, current_goal)
+            new_data[goal_key] = new_goal
         
         # Update rewards
         # Reward is 1.0 (or constant) if t == t', else 0.0
@@ -721,12 +798,42 @@ class GCWorldModel(nj.Module):
         scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
         self.scales = scales
     
+    # Keys that are NOT observations (metadata, goals, actions, etc.)
+    _NON_OBS_KEYS = frozenset({
+        'reward', 'is_first', 'is_last', 'is_terminal', 'cont',
+        'action', 'reset', 'key', 'log_entropy',
+    })
+    
     def _get_obs_keys(self):
-        """Get observation keys (excluding goals)."""
+        """Get observation keys (excluding goals and metadata).
+        
+        Dynamically detects observation keys by excluding:
+        - Keys starting with 'goal' (goal observations)
+        - Keys starting with 'log_' (logging metadata)
+        - Known metadata keys (reward, is_first, is_last, etc.)
+        
+        Raises:
+            ValueError: If no observation keys are found.
+        """
         obs_keys = set()
         for key in self.shapes.keys():
-            if key in ('grid', 'grid_2d'):
-                obs_keys.add(key)
+            # Skip goal keys
+            if key.startswith('goal'):
+                continue
+            # Skip log keys
+            if key.startswith('log_'):
+                continue
+            # Skip known non-observation keys
+            if key in self._NON_OBS_KEYS:
+                continue
+            obs_keys.add(key)
+        
+        if not obs_keys:
+            raise ValueError(
+                f"No observation keys found in obs_space. "
+                f"Available keys: {list(self.shapes.keys())}. "
+                f"Expected at least one of: 'grid', 'grid_2d', 'image', etc."
+            )
         return obs_keys
     
     def _get_goal_keys(self):
@@ -736,6 +843,50 @@ class GCWorldModel(nj.Module):
             if key.startswith('goal'):
                 goal_keys.add(key)
         return goal_keys
+    
+    def _goal_key_to_obs_key(self, goal_key):
+        """Map a goal key to its corresponding observation key.
+        
+        Mapping rules:
+        - 'goal' -> 'grid' (if exists) or 'image' (if exists)
+        - 'goal_2d' -> 'grid_2d' (if exists) or 'image' (if exists)
+        - 'goal_image' -> 'image'
+        - 'goal_<x>' -> '<x>' if '<x>' exists in obs_keys
+        
+        Args:
+            goal_key: The goal key to map
+            
+        Returns:
+            The corresponding observation key
+            
+        Raises:
+            ValueError: If no matching observation key is found
+        """
+        # Direct mapping attempts
+        if goal_key == 'goal':
+            # Try 'grid' first, then 'image'
+            if 'grid' in self._obs_keys:
+                return 'grid'
+            if 'image' in self._obs_keys:
+                return 'image'
+        elif goal_key == 'goal_2d':
+            if 'grid_2d' in self._obs_keys:
+                return 'grid_2d'
+            if 'image' in self._obs_keys:
+                return 'image'
+        elif goal_key == 'goal_image':
+            if 'image' in self._obs_keys:
+                return 'image'
+        else:
+            # Try stripping 'goal_' prefix
+            stripped = goal_key[5:] if goal_key.startswith('goal_') else goal_key
+            if stripped in self._obs_keys:
+                return stripped
+        
+        raise ValueError(
+            f"Cannot map goal key '{goal_key}' to observation key. "
+            f"Available obs_keys: {self._obs_keys}"
+        )
     
     def encode_obs(self, data):
         """Encode only observations (not goals) for world model."""
@@ -754,16 +905,15 @@ class GCWorldModel(nj.Module):
         # Build goal data dict, mapping goal keys to obs keys for encoder
         goal_data = {}
         for key in data:
-            if key == 'goal' and 'grid' in self._obs_keys:
-                goal_data['grid'] = data[key]
-            elif key == 'goal_2d' and 'grid_2d' in self._obs_keys:
-                goal_data['grid_2d'] = data[key]
+            if key in self._goal_keys:
+                obs_key = self._goal_key_to_obs_key(key)
+                goal_data[obs_key] = data[key]
         
         if not goal_data:
             raise ValueError(
-                f"Goal data required but not found or cannot be mapped. "
-                f"Expected 'goal' (with 'grid' in obs_keys) or 'goal_2d' (with 'grid_2d' in obs_keys). "
-                f"Got keys: {list(data.keys())}, obs_keys: {self._obs_keys}"
+                f"Goal data required but not found. "
+                f"Expected keys starting with 'goal' (e.g., 'goal', 'goal_2d', 'goal_image'). "
+                f"Got keys: {list(data.keys())}, goal_keys: {self._goal_keys}"
             )
         
         # Encode with frozen weights (stop_gradient on output)
@@ -786,13 +936,19 @@ class GCWorldModel(nj.Module):
         # Encode only observations for world model
         embed = self.encode_obs(data)
         
-        # Encode goals (frozen) if available
-        # This is needed for the reward head which takes goal_embed
-        goal_embed = None
-        if 'goal' in data or 'goal_2d' in data:
-            # This returns (batch, seq, embed) if data has time dim, or (batch, embed)
-            # data has (batch, seq, ...)
-            goal_embed = self.encode_goal_frozen(data)
+        # Check if any goal keys are present in the data
+        data_goal_keys = [k for k in data.keys() if k in self._goal_keys]
+        
+        # Encode goals (frozen) - REQUIRED for goal-conditioned RL
+        if not data_goal_keys:
+            raise ValueError(
+                f"Goal data required for goal-conditioned world model training. "
+                f"Expected keys from {self._goal_keys} but found none in data. "
+                f"Available keys: {list(data.keys())}"
+            )
+        
+        # This returns (batch, seq, embed) if data has time dim
+        goal_embed = self.encode_goal_frozen(data)
             
         prev_latent, prev_action = state
         prev_actions = jnp.concatenate([
@@ -801,11 +957,7 @@ class GCWorldModel(nj.Module):
             embed, prev_actions, data['is_first'], prev_latent)
         
         dists = {}
-        feats = {**post, 'embed': embed}
-        
-        # Add goal_embed to feats if available
-        if goal_embed is not None:
-            feats['goal_embed'] = goal_embed
+        feats = {**post, 'embed': embed, 'goal_embed': goal_embed}
             
         for name, head in self.heads.items():
             out = head(feats if name in self.config.grad_heads else sg(feats))

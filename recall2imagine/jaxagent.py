@@ -154,7 +154,7 @@ class JAXAgent(embodied.Agent):
       print('Could not disable TensorFlow devices:', e)
     if not self.config.prealloc:
       os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.9'
     xla_flags = []
     if self.config.logical_cpus:
       count = self.config.logical_cpus
